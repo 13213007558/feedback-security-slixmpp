@@ -7,7 +7,7 @@ import asyncio
 from slixmpp.stanza.rootstanza import RootStanza
 from slixmpp.xmlstream import StanzaBase, ET
 from slixmpp.xmlstream.handler import Callback, CoroutineCallback
-from slixmpp.xmlstream.matcher import MatchIDSender, MatcherId
+from slixmpp.xmlstream.matcher import MatchIDSender
 from slixmpp.exceptions import IqTimeout, IqError
 
 
@@ -173,14 +173,16 @@ class Iq(RootStanza):
                                           IQ stanza.
         :rtype: asyncio.Future
         """
-        if self.stream.session_bind_event.is_set():
-            matcher = MatchIDSender({
-                'id': self['id'],
-                'self': self.stream.boundjid,
-                'peer': self['to']
-            })
-        else:
-            matcher = MatcherId(self['id'])
+        # The bare JID and domain of boundjid are known even before
+        # resource binding has completed, and MatchIDSender only relies
+        # on those, so the sender of a reply can always be validated.
+        # Pre-bind IQs (e.g. bind, session) are answered by the server
+        # itself, whose replies carry an empty or domain 'from'.
+        matcher = MatchIDSender({
+            'id': self['id'],
+            'self': self.stream.boundjid,
+            'peer': self['to']
+        })
 
         future = asyncio.Future()
 
