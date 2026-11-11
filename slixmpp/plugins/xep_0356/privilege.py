@@ -13,9 +13,31 @@ from slixmpp.plugins.xep_0356 import stanza, Privilege, Perm
 log = logging.getLogger(__name__)
 
 
+#: Privileges held when the server has not (or no longer) granted anything.
+DEFAULT_PRIVILEGES = {"roster": "none", "message": "none", "presence": "none"}
+
+#: Values accepted for each access type, as defined by XEP-0356.
+#: Anything else received from the server is ignored.
+VALID_PERMS = {
+    "roster": {"none", "get", "set", "both"},
+    "message": {"none", "outgoing"},
+    "presence": {"none", "roster", "managed_entity"},
+}
+
+
 class XEP_0356(BasePlugin):
     """
     XEP-0356: Privileged Entity
+
+    Privileges are only ever granted by the server this component is
+    connected to (matching :attr:`ComponentXMPP.server_host`); privilege
+    advertisements from any other JID are discarded.
+
+    Each received ``<privilege/>`` element replaces the previously granted
+    set: per XEP-0356 it carries the complete list of granted permissions,
+    so any permission it does not mention falls back to ``"none"``.
+    Privileges are also reset to ``"none"`` when the stream disconnects,
+    and must be granted again after reconnection.
 
     Events:
 
@@ -29,12 +51,14 @@ class XEP_0356(BasePlugin):
     dependencies = {"xep_0297"}
     stanza = stanza
 
-    granted_privileges = {"roster": "none", "message": "none", "presence": "none"}
+    granted_privileges = dict(DEFAULT_PRIVILEGES)
 
     def plugin_init(self):
         if not self.xmpp.is_component:
             log.error("XEP 0356 is only available for components")
             return
+
+        self.granted_privileges = dict(DEFAULT_PRIVILEGES)
 
         stanza.register()
 
@@ -45,9 +69,15 @@ class XEP_0356(BasePlugin):
                 self._handle_privilege,
             )
         )
+        self.xmpp.add_event_handler("disconnected", self._reset_privileges)
 
     def plugin_end(self):
         self.xmpp.remove_handler("Privileges")
+        self.xmpp.del_event_handler("disconnected", self._reset_privileges)
+        self._reset_privileges()
+
+    def _reset_privileges(self, *args):
+        self.granted_privileges = dict(DEFAULT_PRIVILEGES)
 
     def _handle_privilege(self, msg: Message):
         """
@@ -56,18 +86,49 @@ class XEP_0356(BasePlugin):
         Stores the privileges in this instance's granted_privileges attribute (a dict)
         and raises the privileges_advertised event
         """
+        if msg["from"].bare != self.xmpp.server_host:
+            log.warning(
+                "Discarding privilege advertisement from unauthorized JID %s "
+                "(only %s may grant privileges)",
+                msg["from"],
+                self.xmpp.server_host,
+            )
+            return
+        # The advertised set is authoritative: start from "none" for every
+        # access type and only apply the permissions explicitly listed.
+        privileges = dict(DEFAULT_PRIVILEGES)
         for perm in msg["privilege"]["perms"]:
-            self.granted_privileges[perm["access"]] = perm["type"]
+            access = perm["access"]
+            perm_type = perm["type"]
+            if access not in VALID_PERMS:
+                log.warning("Ignoring unknown privilege access: %r", access)
+                continue
+            if perm_type not in VALID_PERMS[access]:
+                log.warning(
+                    "Ignoring unknown value %r for privilege access %r",
+                    perm_type,
+                    access,
+                )
+                continue
+            privileges[access] = perm_type
+        self.granted_privileges = privileges
         log.debug(f"Privileges: {self.granted_privileges}")
         self.xmpp.event("privileges_advertised")
 
     def send_privileged_message(self, msg: Message):
+        """
+        Send a message on behalf of a user of the server.
+
+        Raises ValueError if the server did not advertise the corresponding
+        privileges
+        """
         if self.granted_privileges["message"] == "outgoing":
             self._make_privileged_message(msg).send()
         else:
             log.error(
                 "The server hasn't authorized us to send messages on behalf of other users"
             )
+            raise ValueError
 
     def _make_privileged_message(self, msg: Message):
         stanza = self.xmpp.make_message(
