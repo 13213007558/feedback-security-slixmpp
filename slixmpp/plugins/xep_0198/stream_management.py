@@ -8,7 +8,8 @@ import logging
 import collections
 
 from slixmpp.stanza import Message, Presence, Iq, StreamFeatures
-from slixmpp.xmlstream import register_stanza_plugin
+from slixmpp.stanza.stream_error import StreamError
+from slixmpp.xmlstream import ET, register_stanza_plugin
 from slixmpp.xmlstream.handler import Callback, Waiter
 from slixmpp.xmlstream.matcher import MatchXPath, MatchMany
 from slixmpp.plugins.base import BasePlugin
@@ -161,6 +162,14 @@ class XEP_0198(BasePlugin):
         """Reset stream management state."""
         log.debug("session_end, disabling SM")
         self.xmpp.event('sm_disabled', event)
+        self._reset_sm_state()
+
+    def _reset_sm_state(self):
+        """Reset all stream management state.
+
+        Any unacked stanza is dropped: it must not be carried over
+        into a new, unrelated session.
+        """
         self.enabled_in = False
         self.enabled_out = False
         self.unacked_queue.clear()
@@ -168,6 +177,27 @@ class XEP_0198(BasePlugin):
         self.handled = 0
         self.seq = 0
         self.last_ack = 0
+
+    def _abort_sm_protocol_error(self, reason):
+        """Terminate the stream after a fatal stream management error.
+
+        Sends a ``<stream:error>`` with an ``undefined-condition``
+        plus ``handled-count-too-high`` (as per XEP-0198 for ack
+        counts exceeding the number of handled stanzas), resets all
+        stream management state so that nothing leaks into a future
+        session, and disconnects. A fresh session with fresh stream
+        management state will be negotiated on the next connection.
+        """
+        log.error('Aborting stream due to stream management error: %s',
+                  reason)
+        self._reset_sm_state()
+        error = StreamError()
+        error['condition'] = 'undefined-condition'
+        error['text'] = reason
+        error.xml.append(ET.Element(
+            '{urn:xmpp:sm:3}handled-count-too-high'))
+        self.xmpp.send_raw(str(error))
+        self.xmpp.disconnect()
 
     def send_ack(self):
         """Send the current ack count to the server."""
@@ -249,11 +279,24 @@ class XEP_0198(BasePlugin):
 
         Raises a :term:`session_resumed` event.
         """
+        if stanza['previd'] != self.sm_id:
+            # The server acknowledged resumption of a stream that is
+            # not ours. Nothing about the previous session can be
+            # trusted, so tear everything down instead of acking or
+            # replaying stanzas into the wrong session.
+            self._abort_sm_protocol_error(
+                'Resumed stream id %r does not match the requested '
+                'id %r' % (stanza['previd'], self.sm_id))
+            return
+        if not self._handle_ack(stanza):
+            # The ack was impossible; the stream is already being
+            # torn down, so do not resend anything or report a
+            # successful resumption.
+            return
         self.xmpp.features.add('stream_management')
         self.enabled_in = True
-        self._handle_ack(stanza)
-        for id, stanza in self.unacked_queue:
-            self.xmpp.send(stanza, use_filters=False)
+        for seq, unacked in self.unacked_queue:
+            self.xmpp.send(unacked, use_filters=False)
         self.xmpp.event('session_resumed', stanza)
         self.xmpp.end_session_on_disconnect = False
 
@@ -274,28 +317,47 @@ class XEP_0198(BasePlugin):
         """Process a server ack by freeing acked stanzas from the queue.
 
         Raises a :term:`stanza_acked` event for each acked stanza.
-        """
-        if ack['h'] == self.last_ack:
-            return
 
-        num_acked = (ack['h'] - self.last_ack) % MAX_SEQ
+        Returns ``True`` if the ack was valid and has been applied,
+        ``False`` otherwise.
+        """
+        h = ack['h']
+        if h is None:
+            log.error('Received ack without h value, ignoring.')
+            return False
+
+        if h < 0 or h >= MAX_SEQ:
+            self._abort_sm_protocol_error(
+                'Ack h value %r is out of the 32 bit range' % h)
+            return False
+
+        if h == self.last_ack:
+            return True
+
+        num_acked = (h - self.last_ack) % MAX_SEQ
         num_unacked = len(self.unacked_queue)
         log.debug("Ack: %s, Last Ack: %s, " + \
                   "Unacked: %s, Num Acked: %s, " + \
                   "Remaining: %s",
-            ack['h'],
+            h,
             self.last_ack,
             num_unacked,
             num_acked,
             num_unacked - num_acked)
-        if num_acked > len(self.unacked_queue) or num_acked < 0:
-            log.error('Inconsistent sequence numbers from the server,'
-                      ' ignoring and replacing ours with them.')
-            num_acked = len(self.unacked_queue)
+        if num_acked > num_unacked:
+            # The server claims to have handled more stanzas than we
+            # actually sent. The unacked stanzas must NOT be reported
+            # as delivered; per XEP-0198 the stream is terminated
+            # with a handled-count-too-high error instead.
+            self._abort_sm_protocol_error(
+                'Server acknowledged %d stanzas, but only %d were '
+                'sent' % (num_acked, num_unacked))
+            return False
         for x in range(num_acked):
             seq, stanza = self.unacked_queue.popleft()
             self.xmpp.event('stanza_acked', stanza)
-        self.last_ack = ack['h']
+        self.last_ack = h
+        return True
 
     def _handle_request_ack(self, req):
         """Handle an ack request by sending an ack."""
