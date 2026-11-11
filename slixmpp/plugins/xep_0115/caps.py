@@ -160,12 +160,13 @@ class XEP_0115(BasePlugin):
         ifrom = pres['to'] if self.xmpp.is_component else None
 
         if pres['caps']['hash'] not in self.hashes:
+            log.debug("Unknown caps hash: %s", pres['caps']['hash'])
             try:
-                log.debug("Unknown caps hash: %s", pres['caps']['hash'])
-                self.xmpp['xep_0030'].get_info(jid=pres['from'], ifrom=ifrom)
-                return
+                await self.xmpp['xep_0030'].get_info(
+                    jid=pres['from'], ifrom=ifrom)
             except XMPPError:
-                return
+                pass
+            return
 
         log.debug("New caps verification string: %s", ver)
         try:
@@ -178,7 +179,19 @@ class XEP_0115(BasePlugin):
 
             if await self._validate_caps(caps, pres['caps']['hash'],
                                                pres['caps']['ver']):
-                await self.assign_verstring(pres['from'], pres['caps']['ver'])
+                # A newer presence may have changed the entity's ver
+                # while this disco query was in flight. A late reply
+                # must not overwrite the current verstring mapping.
+                current_ver = await self.get_verstring(pres['from'].full)
+                if current_ver is not None and \
+                        str(current_ver) != str(pres['caps']['ver']):
+                    log.debug(
+                        "Ignoring stale caps result for %s, "
+                        "current ver is %s",
+                        pres['caps']['ver'], current_ver)
+                else:
+                    await self.assign_verstring(pres['from'],
+                                                pres['caps']['ver'])
         except XMPPError:
             log.debug("Could not retrieve disco#info results for caps for %s", node)
 
@@ -205,6 +218,19 @@ class XEP_0115(BasePlugin):
                 log.debug("Non form extension found, ignoring for caps")
                 caps.xml.remove(stanza.xml)
                 continue
+
+            # Reject duplicated field vars: get_fields() collapses them
+            # into a dict, so without this check illegal data could be
+            # laundered by de-duplication before the hash is computed.
+            field_vars = [field['var']
+                          for field in stanza['substanzas']
+                          if isinstance(field,
+                                        self.xmpp['xep_0004'].stanza.FormField)]
+            if len(field_vars) != len(set(field_vars)):
+                log.debug("Duplicated form field vars found, "
+                          "invalid for caps")
+                return False
+
             if 'FORM_TYPE' in stanza.get_fields():
                 f_type = tuple(stanza.get_fields()['FORM_TYPE']['value'])
                 form_types.append(f_type)
